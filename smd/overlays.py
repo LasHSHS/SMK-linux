@@ -1,0 +1,127 @@
+"""Merge Snapchat -main and -overlay export files."""
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+from PIL import Image, ImageOps
+
+from smd.ffmpeg_bundle import resolve_ffmpeg
+from smd.procutil import subprocess_flags as _subprocess_flags
+
+# Maximum practical quality for export outputs
+JPEG_QUALITY = 100
+
+# Scale overlay PNG to the main video frame, then composite.
+# Snapchat overlay PNGs almost never match video pixel size; bare overlay=0:0
+# crops the oversized overlay at native scale (zoomed captions).
+# Overlay input must be ``-loop 1`` so the still PNG lasts for the whole clip;
+# ``shortest=1`` then ends the output when the *video* ends. Without looping,
+# shortest stops after the PNG's single frame → a frozen "photo video".
+_VIDEO_OVERLAY_FILTER = (
+    "[1:v][0:v]scale2ref[ov][base];[base][ov]overlay=0:0:format=auto:shortest=1"
+)
+
+
+def merge_image_overlay(main_path: Path, overlay_path: Path, output_path: Path) -> bool:
+    """Composite PNG overlay onto image; save to output_path (atomic write)."""
+    import os
+
+    from smd.fsutil import tmp_sibling
+
+    try:
+        base_raw = Image.open(main_path)
+        base_raw = ImageOps.exif_transpose(base_raw) or base_raw
+        base = base_raw.convert("RGBA")
+        overlay_raw = Image.open(overlay_path)
+        overlay_raw = ImageOps.exif_transpose(overlay_raw) or overlay_raw
+        overlay = overlay_raw.convert("RGBA")
+        if overlay.size != base.size:
+            overlay = overlay.resize(base.size, Image.Resampling.LANCZOS)
+        merged = Image.alpha_composite(base, overlay)
+        out_ext = output_path.suffix.lower()
+        if out_ext == ".webp":
+            # Library outputs are JPEG; never write merged WebP.
+            output_path = output_path.with_suffix(".jpg")
+            out_ext = ".jpg"
+        tmp = tmp_sibling(output_path)
+        if out_ext in (".jpg", ".jpeg"):
+            merged.convert("RGB").save(tmp, format="JPEG", quality=JPEG_QUALITY, subsampling=0)
+        else:
+            merged.save(tmp)
+        os.replace(tmp, output_path)
+        return True
+    except Exception:
+        return False
+
+
+def merge_video_overlay(
+    main_path: Path,
+    overlay_path: Path,
+    output_path: Path,
+    *,
+    threads: int | None = None,
+    metadata_flags: list[str] | None = None,
+) -> bool:
+    """Burn PNG overlay onto video using ffmpeg overlay filter.
+
+    ``metadata_flags`` (from ``smd.metadata.video_metadata_ffmpeg_flags``) are
+    folded into this same encode pass when given, so the caller doesn't need
+    a second, separate ffmpeg remux afterward just to embed the capture date.
+    """
+    from smd.gpu_encode import detect_video_encode_profiles
+
+    import os
+
+    from smd.fsutil import tmp_sibling
+
+    ffmpeg = resolve_ffmpeg()
+    if not ffmpeg:
+        return False
+    startupinfo, creationflags = _subprocess_flags()
+
+    tmp = tmp_sibling(output_path)
+    for profile in detect_video_encode_profiles(ffmpeg):
+        cmd = [
+            ffmpeg,
+            "-nostdin",
+            "-y",
+        ]
+        if threads and threads > 0 and profile.id == "cpu_high_quality":
+            cmd.extend(["-threads", str(threads)])
+        cmd.extend(
+            [
+                "-i",
+                str(main_path),
+                "-loop",
+                "1",
+                "-i",
+                str(overlay_path),
+                "-filter_complex",
+                _VIDEO_OVERLAY_FILTER,
+                *profile.args,
+                "-c:a",
+                "copy",
+                *(metadata_flags or []),
+                str(tmp),
+            ]
+        )
+        try:
+            r = subprocess.run(
+                cmd,
+                capture_output=True,
+                startupinfo=startupinfo,
+                creationflags=creationflags,
+                timeout=300,
+            )
+            if r.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+                os.replace(tmp, output_path)
+                return True
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+    return False

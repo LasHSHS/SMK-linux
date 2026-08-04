@@ -29,9 +29,9 @@ jobs:
       - name: Zip
         run: |
           cd dist
-          mv smd "SMK-linux-x64-v0.1.0-BETA-UNTESTED"
-          zip -r "../SMK-linux-x64-v0.1.0-BETA-UNTESTED.zip" "SMK-linux-x64-v0.1.0-BETA-UNTESTED"
+          mv smd "SMK-linux-x64-v0.1.1-BETA-UNTESTED"
+          zip -r "../SMK-linux-x64-v0.1.1-BETA-UNTESTED.zip" "SMK-linux-x64-v0.1.1-BETA-UNTESTED"
       - uses: actions/upload-artifact@v4
         with:
           name: SMK-linux-x64-BETA-UNTESTED
-          path: SMK-linux-x64-v0.1.0-BETA-UNTESTED.zip
+          path: SMK-linux-x64-v0.1.1-BETA-UNTESTED.zip

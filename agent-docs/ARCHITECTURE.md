@@ -197,12 +197,12 @@ Entry point: `process_bundled_export(...)`. Rough flow:
    those times are usable (not all identical), else UID-stem order. Iterates
    `items.items()` in **sorted-by-stem order** for media-id matching
    determinism. See DECISIONS.md 2026-07-14 (videos) and 2026-07-26 (photos).
-4. **Process each item** - `_process_single_item()`, dispatched one call per
-   memory via a `ThreadPoolExecutor(max_workers=...)`. **Per item**, not
-   globally: writes the raw output first (if "Also save without filters" is
-   on), then the merged output second, in that order, inside the same call.
-   Different items run concurrently across the worker pool; there is no
-   separate global "all raw files, then all merged files" pass.
+4. **Process items** - `_process_single_item()`, via `ThreadPoolExecutor`.
+   When **keep_raw** is on: **two phases** — (1) all missing raw copies
+   (`only="raw"`), then (2) all missing merged/overlay outputs
+   (`only="merged"`). When keep_raw is off: a single merged pass. If merged
+   already exists and only raw is missing, phase 1 fills raw and **skips**
+   overlay re-encode (see DECISIONS 2026-08-04).
    - **No overlay + raw enabled** → fast path: process once into `raw_out`,
      then `link_or_copy()` (`smd/fsutil.py`) hardlinks `merged_out` to it
      instead of a second copy/remux - raw/ and merged/ are byte-identical in

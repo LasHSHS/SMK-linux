@@ -386,6 +386,91 @@ def _write_main_to_output(work_main: Path, dest: Path) -> None:
     atomic_copy(work_main, dest)
 
 
+def _ensure_raw_output(
+    work_main: Path,
+    raw_out: Path,
+    *,
+    memory: Memory | None,
+    is_video: bool,
+    want_meta: bool,
+    ffmpeg_sem: threading.Semaphore | None,
+    ffmpeg_threads: int = 1,
+) -> tuple[bool, str | None]:
+    """Write/refresh the unfiltered raw copy. Returns (ok, error_reason)."""
+    try:
+        raw_container_done = False
+        if is_video and want_meta and memory is not None:
+            if ffmpeg_sem:
+                with ffmpeg_sem:
+                    raw_container_done = copy_video_with_metadata(
+                        work_main, raw_out, memory
+                    )
+            else:
+                raw_container_done = copy_video_with_metadata(
+                    work_main, raw_out, memory
+                )
+        if not raw_container_done:
+            _write_main_to_output(work_main, raw_out)
+        if want_meta and memory is not None:
+            apply_metadata(
+                raw_out, memory, raw_out.suffix, container_date_done=raw_container_done
+            )
+            ts = memory.date.timestamp()
+            os.utime(raw_out, (ts, ts))
+    except OSError as e:
+        return False, str(e)
+
+    ok, reason = validate_media_file(raw_out) if raw_out.exists() else (False, "missing")
+    if ok:
+        return True, None
+    try:
+        _write_main_to_output(work_main, raw_out)
+        if want_meta and memory is not None:
+            apply_metadata(raw_out, memory, raw_out.suffix)
+            ts = memory.date.timestamp()
+            os.utime(raw_out, (ts, ts))
+        ok, reason = validate_media_file(raw_out)
+    except OSError as e:
+        return False, str(e)
+    return ok, (None if ok else reason)
+
+
+def _missing_outputs_message(
+    missing_stems: list[str],
+    *,
+    output_by_stem: dict[str, str],
+    output_names: dict[str, str],
+    merged_dir: Path,
+    keep_raw: bool,
+) -> str:
+    """Plain status text when checkpoint stems need repair (raw vs full)."""
+    n = len(missing_stems)
+    if not keep_raw or n == 0:
+        return (
+            f"Repairing {n} items that were marked finished "
+            f"but had no output file on disk."
+        )
+    raw_only = 0
+    for stem in missing_stems:
+        name = output_by_stem.get(stem) or output_names.get(stem)
+        if name and _output_file_valid(merged_dir / name):
+            raw_only += 1
+    if raw_only == n:
+        return (
+            f"Adding {n:,} raw copies (without filters) — "
+            f"merged library already on disk (not re-encoding)."
+        )
+    if raw_only:
+        return (
+            f"Repairing {n} items ({raw_only} only need a raw copy; "
+            f"{n - raw_only} missing from the merged library)."
+        )
+    return (
+        f"Repairing {n} items that were marked finished "
+        f"but had no output file on disk."
+    )
+
+
 def _base_output_name(memory: Memory | None, item: BundledMediaItem, ext: str) -> str:
     """Preferred output filename (may collide when JSON times match)."""
     if memory:
@@ -996,8 +1081,15 @@ def _process_single_item(
     ffmpeg_sem: threading.Semaphore | None,
     ffmpeg_threads: int = 1,
     planned_output_name: str,
+    only: str | None = None,
 ) -> _ItemOutcome:
-    """Process one bundled media item (thread-safe - no shared mutable state)."""
+    """Process one bundled media item (thread-safe - no shared mutable state).
+
+    ``only``:
+      - ``None`` — full item (raw first when requested, then merged)
+      - ``"raw"`` — unfiltered copy only (never touches a valid merged file)
+      - ``"merged"`` — library file only (writes missing raw first if needed)
+    """
     name = item.main_path.name if item.main_path else stem
     out = _ItemOutcome(stem=stem, display_name=name)
 
@@ -1048,6 +1140,99 @@ def _process_single_item(
     is_video = item.main_ext in (".mp4", ".mov", ".m4v")
     want_meta = bool(apply_meta and memory)
     has_overlay = bool(merge_overlays and item.overlay_path and item.overlay_path.exists())
+    merged_ok = _output_file_valid(merged_out)
+    raw_ok = (not keep_raw) or _output_file_valid(raw_out)
+
+    def _mark_ok(*, did_merge_overlay: bool | None = None) -> _ItemOutcome:
+        out.done = True
+        if want_meta:
+            out.metadata_applied = 1
+        merged_flag = (
+            bool(item.overlay_path)
+            if did_merge_overlay is None
+            else did_merge_overlay
+        )
+        out.report_entry = {
+            "stem": stem,
+            "status": "ok",
+            "merged": merged_flag,
+            "output": merged_out.name,
+            "json_date": memory.date.isoformat() if memory else None,
+        }
+        return out
+
+    def _fail_raw(reason: str | None) -> _ItemOutcome:
+        out.failed = 1
+        out.report_entry = {
+            "stem": stem,
+            "status": "raw_output_failed",
+            "error": reason,
+            "output": raw_out.name,
+        }
+        return out
+
+    # Already complete for this settings combo — never re-encode.
+    if merged_ok and raw_ok and only != "raw":
+        if keep_raw:
+            out.raw_copied = 0
+        return _mark_ok(did_merge_overlay=False)
+
+    # Raw-only phase, or "merged exists / raw missing" on a full pass: copy
+    # originals without touching a good merged (filter) file.
+    if only == "raw" or (keep_raw and merged_ok and not raw_ok):
+        if not keep_raw:
+            # Raw phase is a no-op when the user did not ask for raw copies.
+            return _mark_ok() if merged_ok else out
+        if not raw_ok:
+            ok_raw, raw_reason = _ensure_raw_output(
+                work_main,
+                raw_out,
+                memory=memory,
+                is_video=is_video,
+                want_meta=want_meta,
+                ffmpeg_sem=ffmpeg_sem,
+                ffmpeg_threads=ffmpeg_threads,
+            )
+            if not ok_raw:
+                return _fail_raw(raw_reason)
+            out.raw_copied = 1
+            raw_ok = True
+        # Raw phase stops here even if merged is still missing (phase 2 fills it).
+        if only == "raw":
+            if merged_ok:
+                return _mark_ok()
+            # Partial progress — do not count JSON match stats yet (phase 2 will).
+            out.json_matched = 0
+            out.json_unmatched = 0
+            out.report_entry = {
+                "stem": stem,
+                "status": "raw_ready",
+                "output": raw_out.name,
+                "json_date": memory.date.isoformat() if memory else None,
+            }
+            return out
+        return _mark_ok()
+
+    # From here we need a merged library file. Write missing raw first when
+    # requested (raw-first priority), then build merged — never redo a valid
+    # merged overlay encode just to add raw.
+    if keep_raw and not raw_ok:
+        ok_raw, raw_reason = _ensure_raw_output(
+            work_main,
+            raw_out,
+            memory=memory,
+            is_video=is_video,
+            want_meta=want_meta,
+            ffmpeg_sem=ffmpeg_sem,
+            ffmpeg_threads=ffmpeg_threads,
+        )
+        if not ok_raw:
+            return _fail_raw(raw_reason)
+        out.raw_copied = 1
+        raw_ok = True
+
+    if only == "merged" and merged_ok:
+        return _mark_ok()
 
     # Fast path: with keep_raw on and no overlay to burn into merged/, raw/
     # and merged/ end up byte-identical - process once (into raw_out) and
@@ -1063,49 +1248,19 @@ def _process_single_item(
         if item.overlay_path is None and merge_overlays:
             out.overlays_missing = 1
 
-        raw_write_error: str | None = None
-        try:
-            raw_container_done = False
-            if is_video and want_meta:
-                if ffmpeg_sem:
-                    with ffmpeg_sem:
-                        raw_container_done = copy_video_with_metadata(work_main, raw_out, memory)
-                else:
-                    raw_container_done = copy_video_with_metadata(work_main, raw_out, memory)
-            if not raw_container_done:
-                _write_main_to_output(work_main, raw_out)
-            if want_meta:
-                apply_metadata(
-                    raw_out, memory, raw_out.suffix, container_date_done=raw_container_done
-                )
-                ts = memory.date.timestamp()
-                os.utime(raw_out, (ts, ts))
-        except OSError as e:
-            raw_write_error = str(e)
-
-        ok_raw, raw_reason = (
-            validate_media_file(raw_out) if raw_out.exists() else (False, raw_write_error or "missing")
-        )
-        if not ok_raw:
-            try:
-                _write_main_to_output(work_main, raw_out)
-                if want_meta:
-                    apply_metadata(raw_out, memory, raw_out.suffix)
-                    ts = memory.date.timestamp()
-                    os.utime(raw_out, (ts, ts))
-                ok_raw, raw_reason = validate_media_file(raw_out)
-            except OSError as e:
-                ok_raw, raw_reason = False, str(e)
-        if not ok_raw:
-            out.failed = 1
-            out.report_entry = {
-                "stem": stem,
-                "status": "raw_output_failed",
-                "error": raw_reason,
-                "output": raw_out.name,
-            }
-            return out
-        out.raw_copied = 1
+        if not raw_ok:
+            ok_raw, raw_reason = _ensure_raw_output(
+                work_main,
+                raw_out,
+                memory=memory,
+                is_video=is_video,
+                want_meta=want_meta,
+                ffmpeg_sem=ffmpeg_sem,
+                ffmpeg_threads=ffmpeg_threads,
+            )
+            if not ok_raw:
+                return _fail_raw(raw_reason)
+            out.raw_copied = 1
 
         from smd.fsutil import atomic_copy, link_or_copy
 
@@ -1131,46 +1286,14 @@ def _process_single_item(
             }
             return out
 
-        if want_meta:
-            out.metadata_applied = 1
-
-        out.done = True
-        out.report_entry = {
-            "stem": stem,
-            "status": "ok",
-            "merged": bool(item.overlay_path),
-            "output": merged_out.name,
-            "json_date": memory.date.isoformat() if memory else None,
-        }
-        return out
-
-    raw_write_error: str | None = None
-    if keep_raw:
-        try:
-            raw_container_done = False
-            if is_video and want_meta:
-                if ffmpeg_sem:
-                    with ffmpeg_sem:
-                        raw_container_done = copy_video_with_metadata(work_main, raw_out, memory)
-                else:
-                    raw_container_done = copy_video_with_metadata(work_main, raw_out, memory)
-            if not raw_container_done:
-                _write_main_to_output(work_main, raw_out)
-            if want_meta:
-                apply_metadata(
-                    raw_out, memory, raw_out.suffix, container_date_done=raw_container_done
-                )
-                ts = memory.date.timestamp()
-                os.utime(raw_out, (ts, ts))
-            out.raw_copied = 1
-        except OSError as e:
-            raw_write_error = str(e)
+        return _mark_ok(did_merge_overlay=False)
 
     # When a video needs its date/GPS embedded, fold the -metadata flags into
     # whichever ffmpeg pass already touches the file (overlay burn, or a
     # metadata-aware copy for non-overlay videos) instead of paying for a
     # second, separate remux of the whole file afterward.
     merged_container_done = False
+    did_merge_overlay = False
     if merge_overlays and item.overlay_path and item.overlay_path.exists():
         ok = False
         if item.main_ext in (".jpg", ".jpeg", ".png", ".webp"):
@@ -1191,6 +1314,7 @@ def _process_single_item(
             merged_container_done = ok and meta_flags is not None
         if ok:
             out.merged = 1
+            did_merge_overlay = True
         else:
             shutil.copy2(work_main, merged_out)
             out.overlays_missing = 1
@@ -1241,34 +1365,21 @@ def _process_single_item(
     if keep_raw:
         # A stem is only "done" when every requested output is valid; otherwise
         # the checkpoint would permanently hide a missing/corrupt raw copy.
-        ok_raw, raw_reason = (
-            validate_media_file(raw_out) if raw_out.exists() else (False, raw_write_error or "missing")
-        )
-        if not ok_raw:
-            try:
-                _write_main_to_output(work_main, raw_out)
-                ok_raw, raw_reason = validate_media_file(raw_out)
-            except OSError as e:
-                ok_raw, raw_reason = False, str(e)
-        if not ok_raw:
-            out.failed = 1
-            out.report_entry = {
-                "stem": stem,
-                "status": "raw_output_failed",
-                "error": raw_reason,
-                "output": raw_out.name,
-            }
-            return out
+        if not _output_file_valid(raw_out):
+            ok_raw, raw_reason = _ensure_raw_output(
+                work_main,
+                raw_out,
+                memory=memory,
+                is_video=is_video,
+                want_meta=want_meta,
+                ffmpeg_sem=ffmpeg_sem,
+                ffmpeg_threads=ffmpeg_threads,
+            )
+            if not ok_raw:
+                return _fail_raw(raw_reason)
+            out.raw_copied = 1
 
-    out.done = True
-    out.report_entry = {
-        "stem": stem,
-        "status": "ok",
-        "merged": bool(item.overlay_path),
-        "output": merged_out.name,
-        "json_date": memory.date.isoformat() if memory else None,
-    }
-    return out
+    return _mark_ok(did_merge_overlay=did_merge_overlay)
 
 
 def _apply_item_outcome(
@@ -1709,8 +1820,13 @@ def process_bundled_export(
         allowed_outputs |= {n for n in output_by_stem.values() if n}
         if missing_outputs:
             status(
-                f"Repairing {len(missing_outputs)} items that were marked finished "
-                f"but had no output file on disk."
+                _missing_outputs_message(
+                    missing_outputs,
+                    output_by_stem=output_by_stem,
+                    output_names=output_names,
+                    merged_dir=merged_dir,
+                    keep_raw=keep_raw,
+                )
             )
             if checkpoint_path:
                 _save_checkpoint(
@@ -1773,8 +1889,9 @@ def process_bundled_export(
     except Exception:
         pass
 
-    work_queue: list[tuple[str, BundledMediaItem]] = []
     skipped_existing = 0
+    raw_phase: list[tuple[str, BundledMediaItem]] = []
+    merged_phase: list[tuple[str, BundledMediaItem]] = []
     for stem, item in sorted(items.items()):
         if stem in done_stems or stem in skipped_stems:
             continue
@@ -1786,7 +1903,22 @@ def process_bundled_export(
             output_by_stem[stem] = planned
             skipped_existing += 1
             continue
-        work_queue.append((stem, item))
+        if not planned:
+            ext = item.main_ext or (
+                item.main_path.suffix.lower() if item.main_path else ".mp4"
+            )
+            planned = _base_output_name(match_map.get(stem), item, ext)
+        out_name = _resolve_output_filename(planned, item.main_ext or Path(planned).suffix)
+        merged_ok = _output_file_valid(merged_dir / out_name)
+        raw_ok = (not keep_raw) or _output_file_valid(raw_dir / out_name)
+        if keep_raw:
+            if not raw_ok:
+                raw_phase.append((stem, item))
+            if not merged_ok:
+                merged_phase.append((stem, item))
+        else:
+            if not merged_ok:
+                merged_phase.append((stem, item))
     if skipped_existing:
         status(f"Skipping {skipped_existing} items - outputs already on disk.")
         if checkpoint_path:
@@ -1800,6 +1932,7 @@ def process_bundled_export(
     ffmpeg_sem = threading.Semaphore(max_ffmpeg) if max_ffmpeg > 0 else None
     status_every = 25
     last_reported = 0
+    phase_completed = 0
 
     def report_progress(force: bool = False) -> None:
         nonlocal last_reported
@@ -1809,7 +1942,9 @@ def process_bundled_export(
             last_reported = files_done
             status(f"Processing {files_done}/{total}")
 
-    def run_one(stem: str, item: BundledMediaItem) -> _ItemOutcome:
+    def run_one(
+        stem: str, item: BundledMediaItem, *, only: str | None
+    ) -> _ItemOutcome:
         memory = match_map.get(stem)
         planned = output_names.get(stem)
         if not planned:
@@ -1831,6 +1966,7 @@ def process_bundled_export(
                 ffmpeg_sem=ffmpeg_sem,
                 ffmpeg_threads=ffmpeg_threads,
                 planned_output_name=planned,
+                only=only,
             )
         except Exception as exc:
             fail = _ItemOutcome(stem=stem, display_name=item.main_path.name if item.main_path else stem)
@@ -1839,15 +1975,20 @@ def process_bundled_export(
             fail.report_entry = {"stem": stem, "status": "error", "error": str(exc)}
             return fail
 
-    def handle_outcome(out: _ItemOutcome) -> bool:
+    def handle_outcome(out: _ItemOutcome, *, phase_total: int | None = None) -> bool:
         """Apply result; return False if limit reached."""
-        nonlocal processed_count, since_checkpoint
+        nonlocal processed_count, since_checkpoint, phase_completed, last_reported
         with state_lock:
             if out.repair_note:
                 status(out.repair_note)
+            # raw_ready is an intermediate phase marker — don't pollute the report.
+            entries = report_entries
+            if out.report_entry and out.report_entry.get("status") == "raw_ready":
+                entries = []
             _apply_item_outcome(
-                out, stats, done_stems, skipped_stems, report_entries, output_by_stem
+                out, stats, done_stems, skipped_stems, entries, output_by_stem
             )
+            phase_completed += 1
             if out.done or out.skipped:
                 processed_count += 1
                 since_checkpoint += 1
@@ -1857,23 +1998,49 @@ def process_bundled_export(
                 )
                 since_checkpoint = 0
             limit_hit = limit > 0 and processed_count >= limit
-        report_progress()
+        if phase_total:
+            if (
+                phase_completed <= 3
+                or phase_completed - last_reported >= status_every
+                or phase_completed >= phase_total
+            ):
+                last_reported = phase_completed
+                status(f"Processing {phase_completed}/{phase_total}")
+        else:
+            report_progress()
         return not limit_hit
 
-    if max_workers == 1:
-        for stem, item in work_queue:
-            if should_stop and should_stop():
-                status("Stopped by user.")
-                break
-            if limit > 0 and processed_count >= limit:
-                status(f"Limit reached ({limit} files).")
-                break
-            status(f"Processing {len(done_stems) + len(skipped_stems) + 1}/{total}: {item.main_path.name if item.main_path else stem}")
-            if not handle_outcome(run_one(stem, item)):
-                status(f"Limit reached ({limit} files).")
-                break
-    else:
-        pending = list(work_queue)
+    def run_queue(
+        queue: list[tuple[str, BundledMediaItem]],
+        *,
+        only: str | None,
+        label: str | None = None,
+    ) -> bool:
+        """Run a work queue. Returns False if user stopped / limit hit."""
+        nonlocal phase_completed, last_reported
+        if not queue:
+            return True
+        if label:
+            status(label)
+        phase_completed = 0
+        last_reported = 0
+        phase_total = len(queue)
+        if max_workers == 1:
+            for stem, item in queue:
+                if should_stop and should_stop():
+                    status("Stopped by user.")
+                    return False
+                if limit > 0 and processed_count >= limit:
+                    status(f"Limit reached ({limit} files).")
+                    return False
+                if not handle_outcome(
+                    run_one(stem, item, only=only), phase_total=phase_total
+                ):
+                    status(f"Limit reached ({limit} files).")
+                    return False
+            return True
+
+        pending = list(queue)
         futures: dict = {}
         stop = False
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -1888,14 +2055,14 @@ def process_bundled_export(
                     and (limit <= 0 or processed_count + len(futures) < limit)
                 ):
                     stem, item = pending.pop(0)
-                    fut = executor.submit(run_one, stem, item)
+                    fut = executor.submit(run_one, stem, item, only=only)
                     futures[fut] = stem
                 if not futures:
                     break
                 done_set, _ = wait(futures, return_when=FIRST_COMPLETED)
                 for fut in done_set:
                     futures.pop(fut)
-                    if not handle_outcome(fut.result()):
+                    if not handle_outcome(fut.result(), phase_total=phase_total):
                         stop = True
                         pending.clear()
                 if limit > 0 and processed_count >= limit:
@@ -1905,9 +2072,58 @@ def process_bundled_export(
             if futures and stop:
                 for fut in futures:
                     try:
-                        handle_outcome(fut.result())
+                        handle_outcome(fut.result(), phase_total=phase_total)
                     except Exception:
                         pass
+        return not stop
+
+    # keep_raw: originals first (fast copies), then filter/overlay library pass.
+    # keep_raw off: single merged pass (unchanged).
+    if keep_raw and raw_phase:
+        ok = run_queue(
+            raw_phase,
+            only="raw",
+            label=(
+                f"Saving {len(raw_phase):,} originals without filters first…"
+            ),
+        )
+        if not ok:
+            if checkpoint_path:
+                _save_checkpoint(
+                    checkpoint_path, done_stems, skipped_stems, output_by_stem
+                )
+            if _stop() or (should_stop and should_stop()):
+                stats.stopped_by_user = True
+                _finalize_library_counts(
+                    stats,
+                    done_stems=done_stems,
+                    this_run_processed=processed_count,
+                    merged_dir=merged_dir,
+                )
+                status("Stopped by user.")
+                return stats
+    if merged_phase:
+        label = None
+        if keep_raw and raw_phase:
+            label = (
+                f"Saving {len(merged_phase):,} library files "
+                f"(with filters where needed)…"
+            )
+        ok = run_queue(merged_phase, only="merged" if keep_raw else None, label=label)
+        if not ok and (_stop() or (should_stop and should_stop())):
+            if checkpoint_path:
+                _save_checkpoint(
+                    checkpoint_path, done_stems, skipped_stems, output_by_stem
+                )
+            stats.stopped_by_user = True
+            _finalize_library_counts(
+                stats,
+                done_stems=done_stems,
+                this_run_processed=processed_count,
+                merged_dir=merged_dir,
+            )
+            status("Stopped by user.")
+            return stats
 
     report_progress(force=True)
     if checkpoint_path:

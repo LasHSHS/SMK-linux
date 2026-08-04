@@ -110,11 +110,15 @@ def _build_export_zip(tmp_path: Path) -> Path:
 
 
 def _run_pipeline(zip_path: Path, account_dir: Path) -> tuple:
-    paths = AccountPaths.for_account(account_dir)
+    # Match process_bundled_export's keep_raw=True default so merged/raw nest
+    # correctly (flat account root would also contain technical/).
+    paths = AccountPaths.for_account(account_dir, keep_raw=True)
+    paths.ensure_dirs(keep_raw=True)
     stats = process_bundled_export(
         zip_path,
         account_dir,
         zip_paths=[zip_path],
+        keep_raw=True,
         max_workers=2,
         max_ffmpeg=2,
         ffmpeg_threads=1,
@@ -187,9 +191,9 @@ def test_resume_reprocesses_item_after_missing_merged_output(tmp_path):
     account_dir = tmp_path / "account"
 
     _run_pipeline(zip_path, account_dir)
-    paths = AccountPaths.for_account(account_dir)
+    paths = AccountPaths.for_account(account_dir, keep_raw=True)
 
-    merged_files = sorted(paths.merged_dir.iterdir())
+    merged_files = sorted(p for p in paths.merged_dir.iterdir() if p.is_file())
     assert len(merged_files) == 3
     victim = merged_files[0]
     victim_name = victim.name
@@ -204,7 +208,7 @@ def test_resume_reprocesses_item_after_missing_merged_output(tmp_path):
     assert stats2.json_matched == 1
     restored = paths2.merged_dir / victim_name
     assert restored.is_file()
-    assert len(list(paths2.merged_dir.iterdir())) == 3
+    assert len([p for p in paths2.merged_dir.iterdir() if p.is_file()]) == 3
 
     done, _skipped, _version, _outputs = _load_checkpoint(paths2.checkpoint_path)
     assert len(done) == 3

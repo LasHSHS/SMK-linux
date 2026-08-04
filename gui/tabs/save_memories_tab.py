@@ -568,46 +568,49 @@ class SaveMemoriesTabMixin:
         return self._account_name()
 
     def _list_known_accounts(self) -> list:
-        """Account folders that already exist on disk - in either layout
-        (Desktop/<name>/ simple, or <base_dir>/<name>/ technical) - so the
-        Account section's 'Old account' list and After processing always
-        have real accounts to offer, regardless of the live Technical view
-        toggle."""
-        from smd.account_layout import AccountPaths
+        """SMK-owned account folders only (either layout).
+
+        Never treat a random non-empty Desktop folder (USB dump, downloads,
+        etc.) as an account — ownership requires SMK markers such as
+        ``technical/account_identity.json`` or ``SMK-run-info/``.
+        """
+        from smd.account_layout import AccountPaths, is_smk_account_name
 
         names: set[str] = set()
+        base_dir: Path | None = None
         base_dir_resolved = None
         try:
             base_dir = Path(self.get_download_base_dir())
             base_dir_resolved = base_dir.resolve()
             if base_dir.is_dir():
-                names.update(
-                    d.name
-                    for d in base_dir.iterdir()
-                    if d.is_dir() and not d.name.startswith('.')
-                )
+                for d in base_dir.iterdir():
+                    if not d.is_dir() or d.name.startswith('.'):
+                        continue
+                    if is_smk_account_name(d.name, base_dir=base_dir):
+                        names.add(d.name)
         except Exception:
             pass
 
         try:
             desktop = Path.home() / 'Desktop'
             internal_root = AccountPaths.internal_accounts_root()
+            if internal_root.is_dir():
+                for d in internal_root.iterdir():
+                    if d.is_dir() and not d.name.startswith('.') and is_smk_account_name(
+                        d.name, base_dir=base_dir
+                    ):
+                        names.add(d.name)
             if desktop.is_dir():
                 for d in desktop.iterdir():
                     if not d.is_dir() or d.name.startswith('.'):
                         continue
-                    # The Technical-mode base dir (e.g. Desktop/Memories,
-                    # containing real account subfolders like Las/, Mary/)
-                    # commonly sits directly on the Desktop - it is a
-                    # container, not an account itself, so it must never be
-                    # offered as one just because it's a non-empty folder.
+                    # Technical-mode base dir on Desktop is a container, not an account.
                     try:
                         if base_dir_resolved is not None and d.resolve() == base_dir_resolved:
                             continue
                     except OSError:
                         pass
-                    internal = internal_root / d.name
-                    if internal.is_dir() or any(d.iterdir()):
+                    if is_smk_account_name(d.name, base_dir=base_dir):
                         names.add(d.name)
         except Exception:
             pass
@@ -749,6 +752,7 @@ class SaveMemoriesTabMixin:
     def _activate_existing_account_candidate(self, *, silent: bool = False) -> None:
         from smd.account_layout import (
             ensure_memories_suffix,
+            is_smk_account_name,
             rename_simple_mode_account,
             rename_technical_mode_account,
             resolve_existing_account_layout,
@@ -761,17 +765,52 @@ class SaveMemoriesTabMixin:
                     self, 'Existing account', 'No previous account folder yet.'
                 )
             return
+
+        base_dir = Path(self.get_download_base_dir())
+        if not is_smk_account_name(candidate, base_dir=base_dir):
+            # Stranger folder (or stale candidate) — never rename, never adopt.
+            if not silent:
+                QMessageBox.warning(
+                    self,
+                    'Existing account',
+                    f'"{candidate}" is not an SMK account folder.\n'
+                    'SMK only uses folders it created (or that already contain '
+                    'SMK run info).',
+                )
+            return
+
         final_name = ensure_memories_suffix(candidate)
         if final_name != candidate:
-            base_dir = Path(self.get_download_base_dir())
-            layout_info = resolve_existing_account_layout(candidate, base_dir)
-            try:
-                if layout_info and layout_info[0] == 'technical':
-                    rename_technical_mode_account(layout_info[1] or base_dir, candidate, final_name)
-                else:
-                    rename_simple_mode_account(candidate, final_name)
-            except Exception:
+            # Prefer an already-suffixed SMK folder over renaming the old name.
+            if is_smk_account_name(final_name, base_dir=base_dir):
+                final_name = final_name
+            elif silent:
+                # Never silently rename on startup / mode toggle. Keep working
+                # under the existing owned name until the user confirms.
                 final_name = candidate
+            else:
+                reply = QMessageBox.question(
+                    self,
+                    'Rename account folder?',
+                    f'Rename "{candidate}" to "{final_name}"?\n\n'
+                    'Only confirm if this folder was created by SMK.',
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if reply != QMessageBox.Yes:
+                    final_name = candidate
+                else:
+                    layout_info = resolve_existing_account_layout(candidate, base_dir)
+                    try:
+                        if layout_info and layout_info[0] == 'technical':
+                            rename_technical_mode_account(
+                                layout_info[1] or base_dir, candidate, final_name
+                            )
+                        else:
+                            rename_simple_mode_account(candidate, final_name)
+                    except Exception:
+                        final_name = candidate
+
         if self._set_active_account(final_name, create=False):
             self._old_account_candidate = final_name
             if not silent:
@@ -792,7 +831,8 @@ class SaveMemoriesTabMixin:
         if ok and name:
             self._old_account_candidate = name
             self._refresh_account_section()
-            self._activate_existing_account_candidate(silent=True)
+            # Not silent: if a -memories suffix rename is needed, ask first.
+            self._activate_existing_account_candidate(silent=False)
 
     @staticmethod
     def _is_valid_account_name(name: str) -> bool:

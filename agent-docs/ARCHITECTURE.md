@@ -139,13 +139,14 @@ with each other):
     active account name and its real on-disk `library_root` once one is
     picked - this is the *only* place the resolved save location is shown;
     there is no separate "Where to save"/project-name field.
-- `_list_known_accounts()` unions two disk scans (base_dir's direct
-  children for technical-mode accounts, `Desktop/`'s direct children for
-  simple-mode ones) - **must exclude the technical base_dir folder itself**
-  when it happens to live directly on the Desktop (custom base dirs can be
-  `Desktop/<anything>`; default base is Desktop itself). Without this
-  exclusion a non-empty base_dir container can be mistaken for a
-  simple-mode account - found and fixed 2026-07-19.
+- `_list_known_accounts()` unions AppData internal roots, `base_dir`
+  children, and `Desktop/` children, but **only folders that pass
+  `is_smk_account_name()`** (identity / checkpoint / json / `SMK-run-info`
+  markers). Non-empty Desktop folders alone are not accounts — see
+  DECISIONS 2026-08-04 (USB2 silent rename). Still excludes the technical
+  base_dir container when it sits on the Desktop.
+- Existing-account activate: never silently rename to add `-memories`;
+  rename only after an explicit Yes (e.g. Change output folder).
 - Choosing an export ZIP/folder (`select_export_folder()` - one unified
   folder-picker button, no more separate "Choose ZIP files"/"Choose folder")
   only *suggests* an account (`_suggest_account_from_export()`, non-blocking,

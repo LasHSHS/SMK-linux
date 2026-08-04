@@ -226,15 +226,32 @@ def test_resolve_existing_account_layout_prefers_stored_technical_info(monkeypat
 
 
 def test_resolve_existing_account_layout_falls_back_to_disk_when_no_stored_info(monkeypatch, tmp_path):
+    from smd.account_layout import RUN_INFO_DIRNAME
+
     desktop = tmp_path / "Desktop"
     internal_root = tmp_path / "internal"
     monkeypatch.setattr(AccountPaths, "user_desktop_dir", classmethod(lambda cls, name: desktop / name))
     monkeypatch.setattr(AccountPaths, "internal_accounts_root", classmethod(lambda cls: internal_root))
 
-    (desktop / "Las-memories").mkdir(parents=True)
+    lib = desktop / "Las-memories"
+    lib.mkdir(parents=True)
+    # Legacy account without identity JSON still counts if SMK-run-info exists.
+    (lib / RUN_INFO_DIRNAME).mkdir()
+    (lib / RUN_INFO_DIRNAME / "ABOUT.txt").write_text("SMK run info\n", encoding="utf-8")
 
     result = resolve_existing_account_layout("Las-memories", tmp_path / "base")
     assert result == ("simple", None, False)
+
+
+def test_resolve_existing_account_layout_ignores_non_smk_desktop_folder(monkeypatch, tmp_path):
+    desktop = tmp_path / "Desktop"
+    internal_root = tmp_path / "internal"
+    monkeypatch.setattr(AccountPaths, "user_desktop_dir", classmethod(lambda cls, name: desktop / name))
+    monkeypatch.setattr(AccountPaths, "internal_accounts_root", classmethod(lambda cls: internal_root))
+
+    (desktop / "USB2").mkdir(parents=True)
+    (desktop / "USB2" / "photo.jpg").write_bytes(b"x")
+    assert resolve_existing_account_layout("USB2", tmp_path / "base") is None
 
 
 def test_resolve_existing_account_layout_returns_none_for_unknown_account(monkeypatch, tmp_path):

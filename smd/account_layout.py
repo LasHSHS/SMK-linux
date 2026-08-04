@@ -33,6 +33,63 @@ def ensure_memories_suffix(name: str) -> str:
     return f"{name}{MEMORIES_SUFFIX}"
 
 
+def _dir_has_smk_ownership_markers(account_dir: Path) -> bool:
+    """True if *account_dir* contains files/folders only SMK would write.
+
+    Used so Desktop/USB dumps and other random folders are never treated as
+    accounts (and never renamed). Empty folders do not count.
+    """
+    root = Path(account_dir)
+    if not root.is_dir():
+        return False
+    technical = root / TECHNICAL_DIRNAME
+    markers = (
+        technical / ACCOUNT_IDENTITY_NAME,
+        technical / "checkpoint" / "local_checkpoint.json",
+        technical / "json" / "memories_history.json",
+        root / RUN_INFO_DIRNAME / ACCOUNT_IDENTITY_NAME,
+        root / RUN_INFO_DIRNAME / "ABOUT.txt",
+        root / RUN_INFO_DIRNAME / "README.txt",
+    )
+    if any(path.is_file() for path in markers):
+        return True
+    run_info = root / RUN_INFO_DIRNAME
+    if run_info.is_dir():
+        try:
+            return any(run_info.iterdir())
+        except OSError:
+            return False
+    return False
+
+
+def is_smk_account_dir(account_dir: Path) -> bool:
+    """Whether this directory is an SMK account root (safe to list / rename)."""
+    return _dir_has_smk_ownership_markers(Path(account_dir))
+
+
+def is_smk_account_name(
+    account_name: str,
+    *,
+    base_dir: Path | None = None,
+) -> bool:
+    """Whether *account_name* resolves to an SMK-owned folder somewhere.
+
+    Checks the internal AppData account root, the Desktop library folder, and
+    optionally ``<base_dir>/<name>/`` (technical layout). A plain non-empty
+    Desktop folder with no SMK markers is **not** an account.
+    """
+    name = (account_name or "").strip()
+    if not name:
+        return False
+    candidates = [
+        AccountPaths.internal_accounts_root() / name,
+        AccountPaths.user_desktop_dir(name),
+    ]
+    if base_dir is not None:
+        candidates.append(Path(base_dir) / name)
+    return any(is_smk_account_dir(path) for path in candidates)
+
+
 @dataclass(frozen=True)
 class AccountPaths:
     account_dir: Path
@@ -568,10 +625,14 @@ def resolve_existing_account_layout(
         return ("technical", stored_base, bool(tech_info.get("keep_raw")))
 
     # No stored layout info (account created before this bookkeeping existed) -
-    # fall back to whichever location actually exists on disk.
-    if desktop_dir.is_dir():
+    # fall back to whichever location exists **and is SMK-owned**. Never treat
+    # a random Desktop folder (USB dump, etc.) as an account just because the
+    # name matches.
+    if desktop_dir.is_dir() and (
+        is_smk_account_dir(desktop_dir) or is_smk_account_dir(simple_internal)
+    ):
         return ("simple", None, False)
-    if tech_dir.is_dir():
+    if tech_dir.is_dir() and is_smk_account_dir(tech_dir):
         return ("technical", Path(current_base_dir), False)
     return None
 
@@ -609,11 +670,15 @@ def rename_simple_mode_account(old_name: str, new_name: str) -> list[str]:
     """
     Rename both the Desktop library folder and the matching internal
     %LOCALAPPDATA% account root. Returns actions taken; no-op when unsafe.
+
+    Refuses to touch folders SMK did not create (no ownership markers).
     """
     old_name = (old_name or "").strip()
     new_name = (new_name or "").strip()
     actions: list[str] = []
     if not old_name or not new_name or old_name == new_name:
+        return actions
+    if not is_smk_account_name(old_name):
         return actions
 
     moves = [
@@ -623,6 +688,13 @@ def rename_simple_mode_account(old_name: str, new_name: str) -> list[str]:
     for src, dest, label in moves:
         if not src.exists() or dest.exists():
             continue
+        # Desktop library may only hold media; still require SMK ownership via
+        # is_smk_account_name above. Never move a non-owned Desktop sibling.
+        if label == "desktop" and src.is_dir() and not (
+            is_smk_account_dir(src)
+            or is_smk_account_dir(AccountPaths.internal_accounts_root() / old_name)
+        ):
+            continue
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(src), str(dest))
         actions.append(f"Renamed {label} account folder {old_name} -> {new_name}")
@@ -630,7 +702,10 @@ def rename_simple_mode_account(old_name: str, new_name: str) -> list[str]:
 
 
 def rename_technical_mode_account(base_dir: Path, old_name: str, new_name: str) -> list[str]:
-    """Rename ``<base_dir>/<old_name>/`` when the target name is free."""
+    """Rename ``<base_dir>/<old_name>/`` when the target name is free.
+
+    Refuses folders without SMK ownership markers.
+    """
     old_name = (old_name or "").strip()
     new_name = (new_name or "").strip()
     actions: list[str] = []
@@ -639,6 +714,8 @@ def rename_technical_mode_account(base_dir: Path, old_name: str, new_name: str) 
     src = Path(base_dir) / old_name
     dest = Path(base_dir) / new_name
     if not src.is_dir() or dest.exists():
+        return actions
+    if not is_smk_account_dir(src):
         return actions
     shutil.move(str(src), str(dest))
     actions.append(f"Renamed account folder {old_name} -> {new_name}")

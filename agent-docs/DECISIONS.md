@@ -11,6 +11,21 @@ relevant file/function instead of pasting code.
 
 ---
 
+### 2026-08-04 - Never rename Desktop folders SMK did not create
+
+**What**: `is_smk_account_dir` / `is_smk_account_name` require ownership
+markers (`technical/account_identity.json`, checkpoint/json, or
+`SMK-run-info/`). `_list_known_accounts()` only lists those.
+`resolve_existing_account_layout` no longer treats “folder exists on
+Desktop” as an account. `rename_*_account` refuses non-owned dirs.
+Silent Existing-account activate **never** appends `-memories` / renames;
+rename needs an explicit Yes (Change output folder path).
+
+**Why**: Opening SMK auto-picked Desktop `USB2` (last alphabetically among
+non-empty folders) and silently renamed it to `USB2-memories`. That folder
+was a USB camera dump, not an SMK library. Desktop is shared space —
+“non-empty folder” ≠ “our account.”
+
 ### 2026-08-04 - Raw-first phases; never re-encode when only raw is missing
 
 **What**: With "Also save without filters" on, `process_bundled_export` runs
